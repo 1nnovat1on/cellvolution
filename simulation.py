@@ -8,13 +8,16 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 import os
 import time
 
-
-
 SAVE_FRAMES = False # Will save frames at the expense of considerable simulation speed.
+NETWORK_SAVE_DIR = "networks"  # Directory to save the best cell network
+
+if not os.path.exists(NETWORK_SAVE_DIR):
+    os.makedirs(NETWORK_SAVE_DIR)
 
 class Cell(nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
         super(Cell, self).__init__()
+        
         self.network = nn.Sequential(
             nn.Linear(input_size, hidden_size),
             nn.ReLU(),
@@ -24,6 +27,18 @@ class Cell(nn.Module):
     
     def forward(self, x):
         return self.network(x)
+    
+    def print_network(self):
+        for name, param in self.network.named_parameters():
+            print(f"{name}: {param.data}")
+    
+    def save_network(self, filepath):
+        torch.save(self.state_dict(), filepath)
+        print(f"Network saved to {filepath}")
+    
+    def load_network(self, filepath):
+        self.load_state_dict(torch.load(filepath))
+        print(f"Network loaded from {filepath}")
 
 class Simulation:
     def __init__(self, width, height, n_races, initial_density=0.3):
@@ -39,11 +54,25 @@ class Simulation:
         self.collision_stats = {i: {'wins': 0, 'losses': 0} for i in range(n_races)}
         self.collision_stats[-1] = {'wins': 0, 'losses': 0}  # Add stats for empty/dead cells
         self.all_cells_dead = False
+        self.best_cell_network = None
+        self.max_energy = -1
 
         # Initialize cells based on initial_density
         total_cells = int(width * height * initial_density)
         cells_per_race = total_cells // n_races
         remaining_cells = total_cells % n_races
+
+        # loads neural net with best result from previous runs
+        best_network = None
+        best_energy = -1
+        if os.path.exists(NETWORK_SAVE_DIR):
+            for filename in os.listdir(NETWORK_SAVE_DIR):
+                if filename.startswith("best_cell_network_"):
+                    energy = int(filename.split("_")[-1].split(".")[0])
+                    if energy > best_energy:
+                        best_energy = energy
+                        best_network = torch.load(os.path.join(NETWORK_SAVE_DIR, filename))
+                        print(f'loading {filename}')
 
         for race in range(n_races):
             for _ in range(cells_per_race + (1 if race < remaining_cells else 0)):
@@ -52,13 +81,13 @@ class Simulation:
                     if self.grid[y][x] == -1:  # If the spot is empty
                         self.grid[y][x] = race
                         self.cells[y][x] = Cell(75, 30, 5)
+                        if best_network:
+                            self.cells[y][x].load_state_dict(best_network)
                         break
 
         initial_counts = [np.sum(self.grid == i) for i in range(self.n_races)]
         print("Initial cell counts for each race:", initial_counts)
 
-    
-    
     def initialize_resources(self):
         resources = np.zeros((self.height, self.width))
         num_patches = (self.height * self.width) // 100  # Create resource patches in about 1% of the grid
@@ -99,6 +128,10 @@ class Simulation:
                     consumed = min(self.resources[y, x], 10)
                     cell.energy += consumed
                     self.resources[y, x] -= consumed
+
+                if cell.energy > self.max_energy:
+                    self.max_energy = cell.energy
+                    self.best_cell_network = cell.state_dict()
                 
                 if cell.energy >= self.replication_threshold:
                     self.replicate(cell, new_grid, x, y)
@@ -144,7 +177,7 @@ class Simulation:
                 nx, ny = (x + i) % self.width, (y + j) % self.height
                 cell_type = self.grid[ny, nx]
                 cell_energy = self.cells[ny][nx].energy if self.cells[ny][nx] is not None else 0
-                resource = self.resources[ny, nx]
+                resource = self.resources[ny][nx]
                 neighborhood.extend([cell_type, cell_energy, resource])
         return neighborhood
 
@@ -193,6 +226,11 @@ class Simulation:
         
         print(f"Evolution performed at step {self.step_count}")
 
+    def save_best_network(self):
+        if self.best_cell_network:
+            save_path = os.path.join(NETWORK_SAVE_DIR, f"best_cell_network_{self.max_energy}.pth")
+            torch.save(self.best_cell_network, save_path)
+            print(f"Best network saved with energy {self.max_energy} at {save_path}")
 
 class Visualization:
     def __init__(self, simulation):
@@ -306,10 +344,11 @@ class Visualization:
                 print("Simulation stopped by user.")
                 break
         
+        self.simulation.save_best_network()
+        
         # Keep the plot window open after simulation ends
         plt.ioff()
         plt.show()
-
 
 #sim = Simulation(800, 600, 10, initial_density=0.05)  # for the very patient among us.
 sim = Simulation(40, 30, 5, initial_density=0.1)  # for the rest of you
