@@ -8,7 +8,7 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 import os
 import time
 
-SAVE_FRAMES = False # Will save frames at the expense of considerable simulation speed.
+SAVE_FRAMES = False  # Will save frames at the expense of considerable simulation speed.
 NETWORK_SAVE_DIR = "networks"  # Directory to save the best cell network
 
 if not os.path.exists(NETWORK_SAVE_DIR):
@@ -21,12 +21,22 @@ class Cell(nn.Module):
         self.network = nn.Sequential(
             nn.Linear(input_size, hidden_size),
             nn.ReLU(),
-            nn.Linear(hidden_size, output_size)
+            nn.Linear(hidden_size, output_size + 1)  # +1 for the replication decision
         )
         self.energy = 100
     
     def forward(self, x):
         return self.network(x)
+    
+    @staticmethod
+    def load_partial_state_dict(model, state_dict):
+        model_state_dict = model.state_dict()
+        for name, param in state_dict.items():
+            if name in model_state_dict and param.size() == model_state_dict[name].size():
+                model_state_dict[name].copy_(param)
+            else:
+                print(f"Skipping loading parameter {name} due to size mismatch")
+        model.load_state_dict(model_state_dict)
     
     def print_network(self):
         for name, param in self.network.named_parameters():
@@ -37,8 +47,54 @@ class Cell(nn.Module):
         print(f"Network saved to {filepath}")
     
     def load_network(self, filepath):
-        self.load_state_dict(torch.load(filepath))
+        state_dict = torch.load(filepath)
+        self.load_partial_state_dict(self, state_dict)
         print(f"Network loaded from {filepath}")
+
+    def decide_action(self, neighborhood):
+        outputs = self(torch.FloatTensor(neighborhood).unsqueeze(0)).squeeze(0)
+        action_probs = torch.softmax(outputs, dim=0)
+        action = torch.multinomial(action_probs, 1).item()
+        return action
+
+    def move(self, action, x, y, width, height):
+        if action == 0:  # Move up
+            return x, (y - 1) % height
+        elif action == 1:  # Move right
+            return (x + 1) % width, y
+        elif action == 2:  # Move down
+            return x, (y + 1) % height
+        elif action == 3:  # Move left
+            return (x - 1) % width, y
+        return x, y  # Stay
+
+    def consume(self, resources, x, y):
+        consumed = min(resources[y, x], 10)
+        self.energy += consumed
+        resources[y, x] -= consumed
+
+    def replicate(self, new_grid, cells, x, y, mutation_rate, replication_threshold_range, width, height):
+        if self.energy >= replication_threshold_range[0] and self.energy <= replication_threshold_range[1]:
+            neighbors = [(x, (y-1) % height), ((x+1) % width, y),
+                         (x, (y+1) % height), ((x-1) % width, y)]
+            empty_neighbors = [pos for pos in neighbors if new_grid[pos[1]][pos[0]] == -1]
+            
+            if empty_neighbors:
+                new_x, new_y = random.choice(empty_neighbors)
+                
+                new_cell = Cell(75, 30, 5)  # Match the new input size
+                new_cell.load_state_dict(self.state_dict())
+                
+                if random.random() < mutation_rate:
+                    with torch.no_grad():
+                        for param in new_cell.parameters():
+                            param.add_(torch.randn(param.size()) * 0.1)
+                
+                new_cell.energy = self.energy // 2
+                self.energy = self.energy // 2
+                
+                new_grid[new_y][new_x] = new_grid[y][x]  # Same race as parent
+                cells[new_y][new_x] = new_cell
 
 class Simulation:
     def __init__(self, width, height, n_races, initial_density=0.3):
@@ -49,7 +105,7 @@ class Simulation:
         self.cells = [[None for _ in range(width)] for _ in range(height)]
         self.resources = self.initialize_resources()
         self.step_count = 0
-        self.replication_threshold = 150
+        self.replication_threshold_range = (100, 200)  # Example range for replication
         self.mutation_rate = 0.1
         self.collision_stats = {i: {'wins': 0, 'losses': 0} for i in range(n_races)}
         self.collision_stats[-1] = {'wins': 0, 'losses': 0}  # Add stats for empty/dead cells
@@ -62,7 +118,7 @@ class Simulation:
         cells_per_race = total_cells // n_races
         remaining_cells = total_cells % n_races
 
-        # loads neural net with best result from previous runs
+        # Load neural net with best result from previous runs
         best_network = None
         best_energy = -1
         if os.path.exists(NETWORK_SAVE_DIR):
@@ -71,8 +127,8 @@ class Simulation:
                     energy = int(filename.split("_")[-1].split(".")[0])
                     if energy > best_energy:
                         best_energy = energy
-                        best_network = torch.load(os.path.join(NETWORK_SAVE_DIR, filename))
-                        print(f'loading {filename}')
+                        best_network = os.path.join(NETWORK_SAVE_DIR, filename)
+                        print(f'Loading {filename}')
 
         for race in range(n_races):
             for _ in range(cells_per_race + (1 if race < remaining_cells else 0)):
@@ -80,9 +136,9 @@ class Simulation:
                     x, y = random.randint(0, width-1), random.randint(0, height-1)
                     if self.grid[y][x] == -1:  # If the spot is empty
                         self.grid[y][x] = race
-                        self.cells[y][x] = Cell(75, 30, 5)
+                        self.cells[y][x] = Cell(75, 30, 5)  # Adjusted to 6 outputs
                         if best_network:
-                            self.cells[y][x].load_state_dict(best_network)
+                            self.cells[y][x].load_network(best_network)
                         break
 
         initial_counts = [np.sum(self.grid == i) for i in range(self.n_races)]
@@ -110,56 +166,53 @@ class Simulation:
                     continue
                 
                 neighborhood = self.get_neighborhood(x, y)
-                action_probs = torch.softmax(cell(torch.FloatTensor(neighborhood).unsqueeze(0)).squeeze(0), dim=0)
-                action = torch.multinomial(action_probs, 1).item()
+                action = cell.decide_action(neighborhood)
                 
                 cell.energy -= 1  # Energy cost for existing
                 
-                new_x, new_y = x, y
-                if action == 0:  # Move up
-                    new_y = (y - 1) % self.height
-                elif action == 1:  # Move right
-                    new_x = (x + 1) % self.width
-                elif action == 2:  # Move down
-                    new_y = (y + 1) % self.height
-                elif action == 3:  # Move left
-                    new_x = (x - 1) % self.width
-                elif action == 4:  # Stay and consume
-                    consumed = min(self.resources[y, x], 10)
-                    cell.energy += consumed
-                    self.resources[y, x] -= consumed
+                new_x, new_y = cell.move(action, x, y, self.width, self.height)
+                
+                if action == 4:  # Stay and consume
+                    cell.consume(self.resources, x, y)
+                elif action == 5:  # Replicate
+                    cell.replicate(new_grid, self.cells, x, y, self.mutation_rate, self.replication_threshold_range, self.width, self.height)
 
                 if cell.energy > self.max_energy:
                     self.max_energy = cell.energy
                     self.best_cell_network = cell.state_dict()
                 
-                if cell.energy >= self.replication_threshold:
-                    self.replicate(cell, new_grid, x, y)
-                
-                if new_grid[new_y, new_x] == -1:  # Empty space
-                    new_grid[new_y, new_x] = self.grid[y, x]
+                if new_grid[new_y][new_x] == -1:  # Empty space
+                    new_grid[new_y][new_x] = self.grid[y][x]
                     self.cells[new_y][new_x] = cell
                     new_grid[y, x] = -1
                     self.cells[y][x] = None
-                    self.collision_stats[self.grid[y, x]]['wins'] += 1
+                    self.collision_stats[self.grid[y][x]]['wins'] += 1
                     self.collision_stats[-1]['losses'] += 1
-                elif new_grid[new_y, new_x] != self.grid[y, x]:  # Different race collision
+                elif new_grid[new_y][new_x] != self.grid[y][x]:  # Different race collision
                     other_cell = self.cells[new_y][new_x]
                     if other_cell is None or cell.energy > other_cell.energy:
                         # Current cell wins
                         cell.energy -= other_cell.energy if other_cell else 0
-                        new_grid[new_y, new_x] = self.grid[y, x]
+                        new_grid[new_y][new_x] = self.grid[y][x]
                         self.cells[new_y][new_x] = cell
-                        new_grid[y, x] = -1
+                        new_grid[y][x] = -1
                         self.cells[y][x] = None
-                        self.collision_stats[self.grid[y, x]]['wins'] += 1
-                        self.collision_stats[new_grid[new_y, new_x]]['losses'] += 1
+                        self.collision_stats[self.grid[y][x]]['wins'] += 1
+                        self.collision_stats[new_grid[new_y][new_x]]['losses'] += 1
                     else:
                         other_cell.energy -= cell.energy
-                        new_grid[y, x] = -1
+                        new_grid[y][x] = -1
                         self.cells[y][x] = None
-                        self.collision_stats[self.grid[y, x]]['losses'] += 1   
-                        self.collision_stats[new_grid[new_y, new_x]]['wins'] += 1 
+                        self.collision_stats[self.grid[y][x]]['losses'] += 1   
+                        self.collision_stats[new_grid[new_y][new_x]]['wins'] += 1 
+
+        # Update total race energy after movements and collisions
+        self.total_race_energy = {i: 0 for i in range(self.n_races)}
+        for y in range(self.height):
+            for x in range(self.width):
+                if self.grid[y][x] != -1 and self.cells[y][x] is not None:
+                    self.total_race_energy[self.grid[y][x]] += self.cells[y][x].energy
+
         self.grid = new_grid
         
         # Slow resource regeneration
@@ -169,6 +222,7 @@ class Simulation:
         if self.step_count % 100 == 0:
             print(f"Step {self.step_count}: Active cells: {np.sum(self.grid != -1)}")
             print("Collision stats:", self.collision_stats)
+            print("Total race energy:", self.total_race_energy)
 
     def get_neighborhood(self, x, y):
         neighborhood = []
@@ -181,48 +235,27 @@ class Simulation:
                 neighborhood.extend([cell_type, cell_energy, resource])
         return neighborhood
 
-    def replicate(self, parent_cell, new_grid, x, y):
-        neighbors = [(x, (y-1) % self.height), ((x+1) % self.width, y),
-                     (x, (y+1) % self.height), ((x-1) % self.width, y)]
-        empty_neighbors = [pos for pos in neighbors if new_grid[pos[1]][pos[0]] == -1]
-        
-        if empty_neighbors:
-            new_x, new_y = random.choice(empty_neighbors)
-            
-            new_cell = Cell(75, 30, 5)  # Match the new input size
-            new_cell.load_state_dict(parent_cell.state_dict())
-            
-            if random.random() < self.mutation_rate:
-                with torch.no_grad():
-                    for param in new_cell.parameters():
-                        param.add_(torch.randn(param.size()) * 0.1)
-            
-            new_cell.energy = parent_cell.energy // 2
-            parent_cell.energy = parent_cell.energy // 2
-            
-            new_grid[new_y][new_x] = new_grid[y][x]  # Same race as parent
-            self.cells[new_y][new_x] = new_cell
-
     def evolve(self):
-        performances = np.zeros((self.height, self.width))
-        for y in range(self.height):
-            for x in range(self.width):
-                if self.grid[y, x] != -1 and self.cells[y][x] is not None:
-                    performances[y, x] = self.cells[y][x].energy
-        
-        worst_indices = np.argsort(performances.flatten())[:100]
-        best_indices = np.argsort(performances.flatten())[-100:]
-        
-        for worst, best in zip(worst_indices, best_indices):
-            wy, wx = np.unravel_index(worst, performances.shape)
-            by, bx = np.unravel_index(best, performances.shape)
+        for race in range(self.n_races):
+            performances = np.full((self.height, self.width), -np.inf)  # Initialize to -inf for non-race cells
+            for y in range(self.height):
+                for x in range(self.width):
+                    if self.grid[y][x] == race and self.cells[y][x] is not None:
+                        performances[y][x] = self.cells[y][x].energy
             
-            if self.grid[wy][wx] != -1 and self.grid[by][bx] != -1 and self.cells[wy][wx] is not None and self.cells[by][bx] is not None:
-                self.cells[wy][wx].load_state_dict(self.cells[by][bx].state_dict())
-                with torch.no_grad():
-                    for param in self.cells[wy][wx].parameters():
-                        param.add_(torch.randn(param.size()) * 0.1)
-                self.cells[wy][wx].energy = 100  # Reset energy for new cell
+            worst_indices = np.argsort(performances.flatten())[:100]
+            best_indices = np.argsort(performances.flatten())[-100:]
+            
+            for worst, best in zip(worst_indices, best_indices):
+                wy, wx = np.unravel_index(worst, performances.shape)
+                by, bx = np.unravel_index(best, performances.shape)
+                
+                if self.grid[wy][wx] == race and self.grid[by][bx] == race and self.cells[wy][wx] is not None and self.cells[by][bx] is not None:
+                    self.cells[wy][wx].load_state_dict(self.cells[by][bx].state_dict())
+                    with torch.no_grad():
+                        for param in self.cells[wy][wx].parameters():
+                            param.add_(torch.randn(param.size()) * 0.1)
+                    self.cells[wy][wx].energy = 100  # Reset energy for new cell
         
         print(f"Evolution performed at step {self.step_count}")
 
@@ -343,6 +376,11 @@ class Visualization:
             except KeyboardInterrupt:
                 print("Simulation stopped by user.")
                 break
+
+            except Exception as e:
+                print(f"Simulation stopped due to error: {e}")
+                break
+
         
         self.simulation.save_best_network()
         
